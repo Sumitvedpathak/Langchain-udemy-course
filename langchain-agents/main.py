@@ -4,6 +4,7 @@ from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from langchain.messages import SystemMessage, HumanMessage, ToolMessage
 from langsmith import traceable
+import json
 
 load_dotenv()
 
@@ -54,10 +55,35 @@ def run_agent(question: str):
     "4. if the user does not specify a discount tier, ask them which tier to use - Do NOT assume one."),
                 HumanMessage(content=question)]
 
+    for i in range(MAX_ITERATIONS-1):
+        print(f"\n--- Iteration {i+1} ---")
+        ai_message = llm_with_tools.invoke(messages)
+        tool_calls = ai_message.tool_calls
+        if not tool_calls:
+            print("AI response:", ai_message.content)
+            return ai_message.content
+
+        tool_call = tool_calls[0]
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args", {})
+        tool_call_id = tool_call.get("id")
+        print(f"AI wants to call tool: {tool_name} with args: {tool_args}")
+
+        tool_to_use = tools_dict.get(tool_name)
+        if tool_to_use is None:
+            print(f"Tool {tool_name} not found. Skipping tool call.")
+            continue
+        observation = tool_to_use.invoke(tool_args)
+        print(f"Observation from tool {tool_name}: {observation}")
+        messages.append(ai_message)
+        messages.append(ToolMessage(content=str(observation), tool_call_id=tool_call_id))
+        print(f"-----------------{messages}-----------------")
+
+
 
 def main():
     print("Initializing the chat model...")
-    run_agent("What is the price of a laptop with a silver discount?")
+    print(run_agent("What is the price of a laptop with a silver discount?"))
 
 if __name__ == "__main__":
     main()
