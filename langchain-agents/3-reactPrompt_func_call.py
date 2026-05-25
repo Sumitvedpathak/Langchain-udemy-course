@@ -1,6 +1,7 @@
-import os
-from dotenv import load_dotenv
 import ollama
+import re
+import inspect
+from dotenv import load_dotenv
 from langsmith import traceable
 import json
 
@@ -34,97 +35,96 @@ def apply_discount(price: float, discount_tier: str) -> float:
     discount_rate = discounts_percentages.get(discount_tier.lower(), 0.0) / 100
     return round(price * (1 - discount_rate), 2)
 
-#Ollama can still call the functions without tool schema, by using goolge's docstring format, something as below.
-# def get_product_price(product:str) -> float:
-#     """Looks up the price of a product.
-#     Args:
-#         product (str): The name of the product to look up the price for.
-#     Returns:
-#         float: The price of the product.
-#     """
-#     # Simulate fetching product price
 
-tools_for_llm = [{
-      "type": "function",
-      "function": {
-        "name": "get_product_price",
-        "description": "Looks up the price of a product.",
-        "parameters": {
-          "type": "object",
-          "required": ["product"],
-          "properties": {
-            "product": {"type": "string", "description": "The name of the product to look up the price for"}
-          }
-        }
-      }
-},
-{
-      "type": "function",
-      "function": {
-        "name": "apply_discount",
-        "description": "Applies a discount to the given price and return the final price. Available tiers: bronze, silver, gold.",
-        "parameters": {
-          "type": "object",
-          "required": ["price", "discount_tier"],
-          "properties": {
-            "price": {"type": "number", "description": "The price of the product"},
-            "discount_tier": {"type": "string", "description": "The discount tier to apply (bronze, silver, gold)"}
-          }
-        }
-      }
-    }
-]
+tools = {
+    "get_product_price": get_product_price,
+    "apply_discount": apply_discount
+}
+
+def get_tool_descriptions(tools):
+    descriptions = []
+    for tool_name, tool_func in tools.items():
+        function = getattr(tool_func,"__wrapped__", tool_func)
+        sig = inspect.signature(function)
+        docstring = inspect.getdoc(function) or ""
+        descriptions.append(f"{tool_name}{sig} - {docstring}")
+    
+    return "\n".join(descriptions)
+
+tool_descriptions = get_tool_descriptions(tools)
+tool_names = ", ".join(tools.keys())
+
+prompt = f"""Answer the following questions as best you can. You have access to the following tools:
+
+{tool_descriptions}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {{question}}
+Thought:"""
+
 
 @traceable(name="Ollama chat", run_type="llm")
-def ollama_chat_traced(messages):
-    return ollama.chat(model=MODEL, messages=messages, tools=tools_for_llm)
+def ollama_chat_traced(model, messages, options):
+    return ollama.chat(model=model, messages=messages, options=options)
+
+
 
 @traceable(name="Ollama agent loop")
 def run_agent(question: str):
-    tools=[get_product_price, apply_discount]
-    tools_dict = {
-        "get_product_price": get_product_price,
-        "apply_discount": apply_discount
-    }
-
-   
     print(f"Question: {question}")
-    messages = [
-        {"role": "system", "content": "You are a helpful shopping assistant." \
-    "You have access to a product catalog tool " \
-    "and a discount tool.\n\n" \
-    "STRICT RULES - you must follow these exactly:\n" \
-    "1. NEVER guess or assume any product price. You MUST call get_product_price first to get the real price.\n" \
-    "2. Only call apply_discount AFTER you have received a price from get_product_price. Pass the exact price returned by get_product_price to apply_discount.- do not pass a made-up number\n"
-    "3. NEVER calculate discounts yourself using math. Alway use the apply_discount tool.\n" \
-    "4. if the user does not specify a discount tier, ask them which tier to use - Do NOT assume one."},{
-                   "role": "user", "content": question
-              }]
-    
-
+    react_prompt = prompt.format(question=question)
+    scratchpad = ""
 
     for i in range(MAX_ITERATIONS-1):
         print(f"\n--- Iteration {i+1} ---")
-        ai_message = ollama_chat_traced(messages = messages).message
-        tool_calls = ai_message.tool_calls
-        if not tool_calls:
-            print("AI response:", ai_message.content)
-            return ai_message.content
+        full_prompt = react_prompt+scratchpad
+        ai_message = ollama_chat_traced(
+            model=MODEL,
+            messages = [{"role": "system", "content": full_prompt}],
+            options={"stop":  ["\nObservation"],"temperature": 0}
+            ).message
+        output = ai_message.content
+        final_answer_match = re.search(r"Final Answer:\s*(.+)", output)
+        if final_answer_match:
+            final_answer = final_answer_match.group(1).strip()
+            print("Final Answer:", final_answer)
+            return final_answer
 
-        tool_call = tool_calls[0]
-        tool_name = tool_call.function.name
-        tool_args = tool_call.function.arguments
-        print(f"AI wants to call tool: {tool_name} with args: {tool_args}")
 
-        tool_to_use = tools_dict.get(tool_name)
-        if tool_to_use is None:
-            print(f"Tool {tool_name} not found. Skipping tool call.")
-            continue
-        observation = tool_to_use(**tool_args)
-        print(f"Observation from tool {tool_name}: {observation}")
-        messages.append(ai_message)
-        messages.append({"role": "tool", "content": str(observation)})
-        # print(f"-----------------{messages}-----------------")
+        action_match = re.search(r"Action:\s*(.+)", output)
+        action_input_match = re.search(r"Action Input:\s*(.+)", output)
+
+        if not action_match or not action_input_match:
+            print("AI response:", output)
+            return output
+        
+        tool_name = action_match.group(1).strip()
+        tool_input = action_input_match.group(1).strip()
+
+        print(f"AI wants to call tool: {tool_name} with input: {tool_input}")
+
+        raw_args = [x.strip() for x in tool_input.split(",")]
+        args = [x.split("=",1)[-1].strip().strip("'\"") for x in raw_args]
+
+        if tool_name not in tools:
+            observation = f"Tool {tool_name} not found."
+        else:
+            observation = str(tools[tool_name](*args))
+
+    scratchpad += f"{output}\nObservation: {observation}\nThought:"
+
 
 
 
