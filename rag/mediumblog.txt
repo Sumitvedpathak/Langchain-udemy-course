@@ -1,0 +1,151 @@
+---
+
+The Silent Speedup: How KV Cache Makes AI Feel Instant
+Think of a chef who writes down every recipe the first time they make a dish - so the next time someone orders it, they don't start from scratch. That's roughly what KV cache does inside a large language model. And without it, every ChatGPT response you've ever gotten would be about 10x slower.
+Here's the thing - most people using AI tools every day have no idea this optimization exists. And most developers building on top of LLMs know it exists but aren't sure exactly how it works, why it matters for their infrastructure costs, or how they could implement something similar themselves.
+Let's fix all three.
+
+---
+
+TL;DR
+Every time an LLM generates a token, it has to "look back" at everything it's already said - KV cache stores that lookback so it doesn't repeat the work
+Without KV cache, inference cost scales quadratically with context length - it's a computational disaster
+KV cache is the reason long-context models are actually usable
+It also eats a lot of GPU memory, which is why techniques like paged attention and prefix caching exist
+You can implement a simple version yourself in under 50 lines of Python - and understanding that implementation makes everything else click
+
+---
+
+The Problem: Transformers Are Forgetful by Design
+To understand KV cache, you first need to understand how transformers generate text.
+LLMs don't produce an entire response in one shot. They generate one token at a time, autoregressively. Each new token is predicted based on everything that came before it.
+So if Alice asks a model a question and the response is 200 tokens long, the model doesn't write all 200 at once. It writes token 1, then uses token 1 to predict token 2, then uses tokens 1–2 to predict token 3, and so on.
+That's fine. But here's the painful part.
+At every single step, the attention mechanism inside the transformer needs to look at all previous tokens and compute relationships between them. Specifically, it computes three things for each token: a Query (Q), a Key (K), and a Value (V).
+Without caching, every time you generate a new token, you'd recompute K and V for every token that came before it. For a 1,000-token response, you'd be doing this 1+2+3+…+1000 times. That's half a million redundant computations - for a single response.
+This is the problem KV cache solves.
+
+---
+
+How KV Cache Actually Works
+The key insight is simple: the K and V vectors for any token don't change once that token is in the sequence.
+Token 5 in Alice's prompt will always produce the same Key and Value vectors - regardless of how many tokens come after it. So why compute them again?
+KV cache stores these vectors in GPU memory the first time they're computed. On every subsequent generation step, the model just reads them from cache rather than recomputing them from scratch.
+The only thing the model does compute fresh is the Query for the new token being generated - because that depends on what just happened.
+Think of it this way. Imagine you're summarizing a 50-page report. You read all 50 pages once, take thorough notes, and put them on your desk. Now for every follow-up question someone asks you, you check your notes - you don't re-read all 50 pages. KV cache is your notes.
+The result? Token generation becomes nearly O(n) instead of O(n²). That's the difference between scaling gracefully and grinding to a halt.
+
+---
+
+Enabling KV Cache During Inference - The Practical Guide
+Good news: if you're using a mainstream inference library, KV cache is usually on by default. Bad news: it's easy to accidentally disable it, misconfigure it, or miss the features that extend it further.
+
+Here's how it looks across the three most common setups.
+Hugging Face Transformers
+When you call model.generate(), KV cache is enabled automatically. You don't do anything special.
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+
+inputs = tokenizer("Explain transformers in simple terms", return_tensors="pt")
+
+# KV cache is ON by default - use_cache=True is the default
+output = model.generate(**inputs, max_new_tokens=200)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+If for any reason you want to disable it (useful for debugging memory usage or benchmarking):
+# KV cache OFF - slower, but lower memory footprint
+output = model.generate(**inputs, max_new_tokens=200, use_cache=False)
+One thing to watch: if you're doing custom forward passes instead of generate(), you need to manage the past_key_values object yourself and pass it back in on each step. Most people don't need this - but if you're building a custom generation loop, that's the handle.
+vLLM (Self-hosted, High-throughput)
+vLLM enables KV cache with paged attention automatically - it's the whole point of the library. You just run your inference as normal.
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Llama-3.2-3B-Instruct")
+
+sampling_params = SamplingParams(temperature=0.7, max_tokens=200)
+
+outputs = llm.generate(
+    ["Explain transformers in simple terms"],
+    sampling_params
+)
+print(outputs[0].outputs[0].text)
+What's worth knowing: vLLM's gpu_memory_utilization parameter (default 0.90) controls how much GPU memory is reserved for the KV cache pool. If you're running into memory errors or want to serve more concurrent users, tuning this is your first lever.
+# Tune memory reserved for KV cache
+llm = LLM(
+    model="meta-llama/Llama-3.2-3B-Instruct",
+    gpu_memory_utilization=0.85  # lower = less KV cache, more headroom
+)
+Anthropic API - Prompt Caching (Prefix Cache)
+Anthropic's version of KV cache is called prompt caching. It lets you mark a portion of your prompt so the computed KV state for it gets stored server-side and reused across requests.
+This is most useful when you have a long, stable system prompt - think a multi-page document, a detailed persona, or a fixed set of instructions that every user hits.
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    system=[
+        {
+            "type": "text",
+            "text": "You are a helpful AI assistant. [Your long stable system prompt here...]",
+            "cache_control": {"type": "ephemeral"}  # marks this block for caching
+        }
+    ],
+    messages=[
+        {"role": "user", "content": "Summarise the key points from the document."}
+    ]
+)
+
+print(response.content[0].text)
+
+# Check cache usage in the response
+usage = response.usage
+print(f"Cache read tokens: {usage.cache_read_input_tokens}")
+print(f"Cache write tokens: {usage.cache_creation_input_tokens}")
+The cache_control field is the only thing you add. Everything else is the same as a normal API call. On the first request, Anthropic computes and stores the cache. On subsequent requests that share the same prefix, it reads from cache - and you'll see cache_read_input_tokens go up while your latency and cost go down.
+The cache lives for 5 minutes and resets on each hit - so as long as requests keep coming in, you keep benefiting.
+Quick summary of what to use when:
+
+One practical tip that saves money immediately: if you're using the Anthropic or OpenAI API with a consistent system prompt, restructure your messages so the stable part comes first and the user-specific part comes last. Both providers implement prefix caching server-side - your cache hit rate goes up the more your prompt prefix stays identical across requests.
+
+---
+
+The Catch: Memory Eats You Alive
+There's no free lunch. KV cache trades compute for memory.
+For every token in the context window, you need to store K and V tensors across all layers and all attention heads. In a large model, this adds up fast.
+Let's run some rough numbers. A model with 32 layers, 32 attention heads, and a hidden dimension of 128 per head - serving a 32,000-token context - can require gigabytes of KV cache per request. Run hundreds of concurrent users and you hit the ceiling in a hurry.
+This is why the context length explosion we've seen in recent models (from 4K to 128K to 1M tokens) hasn't been free. Longer context = larger KV cache = more memory per request = fewer users you can serve simultaneously.
+Engineers building inference systems had to get creative.
+
+---
+
+Three Ways the Industry Has Learned to Cope
+Paged Attention - Borrowing from Your OS
+vLLM introduced a concept borrowed directly from operating systems: virtual memory paging.
+Instead of allocating one big contiguous block of GPU memory for a request's KV cache upfront, vLLM allocates memory in fixed-size pages and maps them dynamically as needed. You don't pre-allocate for the maximum possible response length - you grow as you go.
+This dramatically improves GPU utilization across many concurrent requests. It's the reason vLLM became the go-to inference engine for self-hosted models almost overnight.
+Grouped-Query Attention - Shrinking the Cache at the Architecture Level
+Standard multi-head attention computes separate K and V vectors for every attention head. Multi-Query Attention (MQA) uses a single shared K and V across all heads - reducing KV cache size by the number of heads, with a small quality trade-off.
+Grouped-Query Attention (GQA) is the sweet spot - small groups of heads share K and V. Llama 3, Mistral, and most modern open-source models use GQA. It cuts KV cache size substantially while preserving most of the quality benefits of full multi-head attention.
+Prefix Caching - Don't Compute the Same Prompt Twice
+This one is underrated and wildly practical.
+If your application always starts requests with the same system prompt - which is extremely common in production - you're computing and caching the KV tensors for that prefix thousands of times over. Complete waste.
+Prefix caching detects when an incoming request shares a leading prefix with a previously processed one, and reuses those cached KV tensors directly. You only compute K and V for the new part of each request.
+Anthropic ships this as a first-class API feature. OpenAI does too. For developers running large-scale applications with consistent system prompts, the latency and cost savings are real and immediate.
+
+---
+
+What This Means If You're Building on LLMs
+A few things worth internalizing if you ship products powered by language models:
+Context length and cost aren't linear. Every token you add to the context means more KV cache to store and maintain. Be deliberate about what goes in the prompt - especially in high-traffic applications.
+Prefix caching rewards stable system prompts. If your system prompt changes per user or per request, you lose the cache hit. Keep the invariant parts of your prompt at the top, user-specific content at the bottom. You'll pay for fewer tokens and see lower latency.
+Architecture choices affect your infra costs. A model using GQA with a smaller KV footprint might be worth it over a model with slightly better benchmarks but double the memory cost, depending on your traffic patterns.
+In custom implementations, always detach your cache. As shown above - gradients through cached tensors cause correctness issues and memory leaks. Cache is for inference, not training.
+
+---
+
+The KV cache isn't glamorous. It doesn't show up in model benchmark leaderboards. Nobody posts a tweet when a new caching strategy ships.
+But the next time a model replies to your 50,000-token context in under two seconds, or you notice that your API costs dropped after you restructured your system prompt - you'll know exactly what's doing the work. And now you know enough to build a version of it yourself.
+That's a rare combination. Most people pick one or the other.
