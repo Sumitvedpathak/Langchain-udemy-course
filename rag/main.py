@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassThrough
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -21,15 +21,12 @@ vector_store = PineconeVectorStore(
 
 retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-prompt_template = """Answer the question based on the following context: {context}
-Question: {question}
-Provide a concise and accurate detail answer."""
 
 def format_docs(docs):
     return "\n\n".join([doc.page_content for doc in docs])
 
-def retrival_chain_without_ICEL(query):
-    """Simple retrieval chain without using ICELLM.
+def retrival_chain_without_LCEL(query):
+    """Simple retrieval chain without using LCELLM.
     Limitations:
     - Manual Step by step execution.
     - No built in streaming support
@@ -37,6 +34,10 @@ def retrival_chain_without_ICEL(query):
     - Harder to compose with other chains
     - More verbose and error prone.
     """
+    prompt_template = """Answer the question based on the following context: 
+    {context}
+    Question: {question}
+    Provide a concise and accurate detail answer."""
 
     # Step 1: Retrieve relevant documents
     docs = retriever.invoke(query)
@@ -52,8 +53,8 @@ def retrival_chain_without_ICEL(query):
 
     return response.content
 
-def retrival_chain_with_ICEL():
-    """Retrieval chain using ICELLM.
+def retrival_chain_with_LCEL():
+    """Retrieval chain using LCELLM.
     Benefits:
     - Declarative and composable: Easy to chain operations with pipe operator(|).
     - Built in support for streaming and async operations.
@@ -63,13 +64,36 @@ def retrival_chain_with_ICEL():
     - Resusable: Chain can be saved, shared, and composed with other chains
     - Better debugging: Langchain provides better observability tools.
     """
-    retrieval_chain = (prompt_template|llm|StrOutputParser())
 
+    prompt_template = ChatPromptTemplate.from_template("""Answer the question based on the following context: 
+    {context}
+    Question: {question}
+    Provide a concise and accurate detail answer.""")
+
+    # retrieval_chain = retriever | format_docs | prompt_template | llm | StrOutputParser()
+
+    retrieval_chain = (
+        RunnableParallel({
+            "context":retriever | format_docs,
+            "question":RunnablePassthrough()
+        }) | prompt_template | llm | StrOutputParser())
+
+    # retrieval_chain = (
+    #     RunnablePassthrough.assign(
+    #         context = itemgetter[str]("question") | retriever | format_docs
+    #     ) | prompt_template | llm | StrOutputParser())
 
     return retrieval_chain
 
 if __name__ == "__main__":
     print("Retrieving relevant documents...")
+    print("Answering question without LCELLM...")
+    
     query = "What is vLLM?"
-    answer = retrival_chain_without_ICEL(query)
+
+    answer = retrival_chain_without_LCEL(query)
+    print(f"Answer: {answer}")
+
+    print("\nAnswering question with LCELLM...")
+    answer = retrival_chain_with_LCEL().invoke(query)
     print(f"Answer: {answer}")
